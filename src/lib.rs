@@ -837,6 +837,64 @@ mod test {
         }
     }
 
+    mod notify_get {
+        use super::*;
+        #[test]
+        fn it_removes_expired_entries() {
+            let ttl = Duration::from_millis(200);
+            let mut lru_cache = LruCache::<usize, usize>::with_expiry_duration(ttl);
+            let _ = lru_cache.insert(1, 1);
+            let _ = lru_cache.insert(2, 2);
+            sleep(250);
+
+            let val = lru_cache.notify_get(&1);
+            assert_eq!(val.0, None);
+            assert_eq!(lru_cache.map.len(), 0);
+        }
+
+        #[test]
+        fn it_returns_removed_expired_entries() {
+            let ttl = Duration::from_millis(200);
+            let mut lru_cache = LruCache::<usize, usize>::with_expiry_duration(ttl);
+            let _ = lru_cache.insert(1, 1);
+            let _ = lru_cache.insert(2, 2);
+            sleep(250);
+
+            let (_val, expired) = lru_cache.notify_get(&1);
+
+            assert_eq!(expired.len(), 2);
+            assert_eq!(expired[0], (1, 1));
+            assert_eq!(expired[1], (2, 2));
+        }
+
+        #[test]
+        fn notify_get_keep_ts_keeps_ts() {
+            let ttl = Duration::from_millis(200);
+            let mut lru_cache = LruCache::<usize, usize>::with_expiry_duration(ttl);
+            let _ = lru_cache.insert(1, 1);
+            let _ = lru_cache.insert(2, 2);
+            sleep(100);
+            let (val, _expired) = lru_cache.notify_get(&1);
+            assert_eq!(val, Some(&1));
+
+            sleep(100);
+            // the following get doesn't update ts
+            // 2 is expired but 1 is still live
+            let (val, expired) = lru_cache.notify_get_keep_ts(&1);
+            assert_eq!(val, Some(&1));
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0], (2, 2));
+            sleep(150);
+
+            // should be expired now
+            let (val, expired) = lru_cache.notify_get_keep_ts(&1);
+            assert_eq!(val, None);
+            assert_eq!(lru_cache.len(), 0);
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0], (1, 1));
+        }
+    }
+
     mod iter {
         use super::*;
 
