@@ -204,8 +204,12 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     ///
     /// If the key already existed in the cache, the existing value is returned and overwritten in
     /// the cache.  Otherwise, the key-value pair is inserted and `None` is returned.
-    /// Evicts and returns expired entries.
-    pub fn notify_insert(&mut self, key: Key, value: Value) -> (Option<Value>, Vec<(Key, Value)>) {
+    /// Evicts and returns expired entries and removed lru_entries.
+    pub fn notify_insert(
+        &mut self,
+        key: Key,
+        value: Value,
+    ) -> (Option<Value>, Vec<(Key, Value)>, Vec<(Key, Value)>) {
         let now = Instant::now();
         self.do_notify_insert(key, value, now)
     }
@@ -357,7 +361,7 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     }
 
     /// Returns an iterator over all entries that updates the timestamps as values are
-    /// traversed. Also removes expired elements before creating the iterator.
+    /// traversed. Values are removed as they are encountered during iteration.
     /// Values are produced in the most recently used order.
     ///
     /// Also, evicts and returns expired entries.
@@ -422,8 +426,9 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         key: Key,
         value: Value,
         now: Instant,
-    ) -> (Option<Value>, Vec<(Key, Value)>) {
+    ) -> (Option<Value>, Vec<(Key, Value)>, Vec<(Key, Value)>) {
         let expired = self.remove_expired(now);
+        let mut lru_values = Vec::new();
 
         let new_size = self.meter.measure(&key, &value);
         self.current_measure = self.meter.add(self.current_measure, new_size);
@@ -434,12 +439,13 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
                 .meter
                 .sub(self.current_measure, self.meter.measure(&key, &old))
         } else {
-            self.remove_lru();
+            lru_values = self.remove_lru();
             self.list.push_back(key.clone());
         };
         (
             self.map.insert(key, (value, now)).map(|pair| pair.0),
             expired,
+            lru_values,
         )
     }
 
@@ -456,7 +462,7 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     }
 
     /// If expiry timeout is set, removes expired items from the cache and returns them.
-    fn remove_expired(&mut self, now: Instant) -> Vec<(Key, Value)> {
+    pub fn remove_expired(&mut self, now: Instant) -> Vec<(Key, Value)> {
         let (map, list, current_measure) =
             (&mut self.map, &mut self.list, &mut self.current_measure);
         let meter = &self.meter;
@@ -487,16 +493,21 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     }
 
     /// Removes least recently used items to make space for new ones.
-    fn remove_lru(&mut self) {
+    pub fn remove_lru(&mut self) -> Vec<(Key, Value)> {
+        let mut lru_values = Vec::new();
         while self.size() >= self.capacity.try_into().unwrap() {
             let _ = self.list.pop_front().map(|k| {
-                let _ = self.map.remove(&k).map(|(v, _)| {
+                if let Some(v) = self.map.remove(&k).map(|(v, _)| {
                     self.current_measure = self
                         .meter
                         .sub(self.current_measure, self.meter.measure(&k, &v));
-                });
+                    v
+                }) {
+                    lru_values.push((k, v));
+                }
             });
         }
+        lru_values
     }
 }
 
@@ -728,7 +739,7 @@ mod test {
             let _ = lru_cache.insert(2, 2);
             sleep(250);
 
-            let (_replaced, expired) = lru_cache.notify_insert(3, 3);
+            let (_replaced, expired, _lru_values) = lru_cache.notify_insert(3, 3);
 
             assert_eq!(expired.len(), 2);
             assert_eq!(expired[0], (1, 1));

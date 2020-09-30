@@ -1,5 +1,12 @@
-#[cfg(feature = "heapsize")]
-extern crate heapsize;
+// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
 
 use std::borrow::Borrow;
 
@@ -99,7 +106,6 @@ impl<K, V> CountableMeterWithMeasure<K, V, ()> for Count {
     }
 }
 
-#[cfg(feature = "heapsize")]
 mod heap_meter {
     use heapsize::HeapSizeOf;
     use std::borrow::Borrow;
@@ -108,7 +114,7 @@ mod heap_meter {
     ///
     /// Requires cache entries that implement [`HeapSizeOf`][1].
     ///
-    /// [1]: https://doc.servo.org/heapsize/trait.HeapSizeOf.html
+    /// [1]: https://docs.rs/heapsize/0.4.2/heapsize/
     pub struct HeapSize;
 
     impl<K, V: HeapSizeOf> super::Meter<K, V> for HeapSize {
@@ -123,5 +129,4 @@ mod heap_meter {
     }
 }
 
-#[cfg(feature = "heapsize")]
 pub use heap_meter::*;
