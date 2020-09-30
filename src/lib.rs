@@ -79,7 +79,8 @@
     box_pointers,
     missing_copy_implementations,
     missing_debug_implementations,
-    variant_size_differences
+    variant_size_differences,
+    clippy::type_complexity
 )]
 
 #[cfg(feature = "sn_fake_clock")]
@@ -95,7 +96,7 @@ use std::usize;
 mod iter;
 mod meter;
 pub use crate::iter::{Iter, NotifyIter, PeekIter, TimedEntry};
-pub use crate::meter::{Count, CountableMeter, Meter};
+pub use crate::meter::{Count, CountableMeter, HeapSize, Meter};
 
 /// A view into a single entry in an LRU cache, which may either be vacant or occupied.
 pub enum Entry<'a, Key: 'a, Value: 'a, M: CountableMeter<Key, Value> = Count> {
@@ -247,6 +248,16 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         self.list.clear();
     }
 
+    /// Much like `get_keep_ts()`, except in addition returns expired entries.
+    pub fn notify_get_keep_ts<Q: ?Sized>(&mut self, key: &Q) -> (Option<&Value>, Vec<(Key, Value)>)
+    where
+        Key: Borrow<Q>,
+        Q: Ord,
+    {
+        let (value, expired) = self.notify_get_mut_keep_ts(key);
+        (value.map(|v| &*v), expired)
+    }
+
     /// Much like `get()`, except in addition returns expired entries.
     pub fn notify_get<Q: ?Sized>(&mut self, key: &Q) -> (Option<&Value>, Vec<(Key, Value)>)
     where
@@ -267,6 +278,16 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         self.get_mut(key).map(|v| &*v)
     }
 
+    /// Retrieves a reference to the value stored under `key`, or `None` if the key doesn't exist.
+    /// Also removes expired elements. This method doesn't update timestamp.
+    pub fn get_keep_ts<Q: ?Sized>(&mut self, key: &Q) -> Option<&Value>
+    where
+        Key: Borrow<Q>,
+        Q: Ord,
+    {
+        self.get_mut_keep_ts(key).map(|v| &*v)
+    }
+
     /// Returns a reference to the value with the given `key`, if present and not expired, without
     /// updating the timestamp.
     pub fn peek<Q: ?Sized>(&self, key: &Q) -> Option<&Value>
@@ -275,6 +296,20 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         Q: Ord,
     {
         self.do_peek(key, Instant::now())
+    }
+
+    /// Retrieves a mutable reference to the value stored under `key`, or `None` if the key doesn't
+    /// exist. Also removes expired elements. This method doesn't update the time stamp.
+    pub fn notify_get_mut_keep_ts<Q: ?Sized>(
+        &mut self,
+        key: &Q,
+    ) -> (Option<&mut Value>, Vec<(Key, Value)>)
+    where
+        Key: Borrow<Q>,
+        Q: Ord,
+    {
+        let now = Instant::now();
+        self.do_notify_get_mut_keep_ts(key, now)
     }
 
     /// Retrieves a mutable reference to the value stored under `key`, or `None` if the key doesn't
@@ -296,6 +331,16 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         Q: Ord,
     {
         self.notify_get_mut(key).0
+    }
+
+    /// Retrieves a mutable reference to the value stored under `key`, or `None` if the key doesn't
+    /// exist.  Also removes expired elements. This method doesn't update the time.
+    pub fn get_mut_keep_ts<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut Value>
+    where
+        Key: Borrow<Q>,
+        Q: Ord,
+    {
+        self.notify_get_mut_keep_ts(key).0
     }
 
     /// Returns whether `key` exists in the cache or not.
@@ -421,6 +466,27 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
         )
     }
 
+    fn do_notify_get_mut_keep_ts<Q: ?Sized>(
+        &mut self,
+        key: &Q,
+        now: Instant,
+    ) -> (Option<&mut Value>, Vec<(Key, Value)>)
+    where
+        Key: Borrow<Q>,
+        Q: Ord,
+    {
+        let expired = self.remove_expired(now);
+
+        let list = &mut self.list;
+        (
+            self.map.get_mut(key).map(|result| {
+                Self::update_key(list, key);
+                &mut result.0
+            }),
+            expired,
+        )
+    }
+
     fn do_notify_insert(
         &mut self,
         key: Key,
@@ -437,7 +503,7 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
             Self::update_key(&mut self.list, &key);
             self.current_measure = self
                 .meter
-                .sub(self.current_measure, self.meter.measure(&key, &old))
+                .sub(self.current_measure, self.meter.measure(&key, &old));
         } else {
             lru_values = self.remove_lru();
             self.list.push_back(key.clone());
@@ -671,6 +737,18 @@ mod test {
         assert_eq!(lru_cache.len(), 1);
     }
 
+    #[test]
+    fn test_heapsize_cache() {
+        let mut cache = LruCache::<&str, (u8, u8, u8), HeapSize>::with_meter(8, HeapSize);
+        let _ = cache.insert("foo1", (1, 2, 3));
+        let _ = cache.insert("foo2", (4, 5, 6));
+        let _ = cache.insert("foo3", (7, 8, 9));
+        assert!(!cache.contains_key("foo1"));
+        let _ = cache.insert("foo2", (10, 11, 12));
+        let _ = cache.insert("foo4", (13, 14, 15));
+        assert!(!cache.contains_key("foo3"));
+    }
+
     #[derive(PartialEq, PartialOrd, Ord, Clone, Eq)]
     struct Temp {
         id: Vec<u8>,
@@ -744,6 +822,18 @@ mod test {
             assert_eq!(expired.len(), 2);
             assert_eq!(expired[0], (1, 1));
             assert_eq!(expired[1], (2, 2));
+        }
+
+        #[test]
+        fn it_returns_lru_entries() {
+            let mut lru_cache = LruCache::<usize, usize>::with_capacity(3);
+            let _ = lru_cache.insert(1, 1);
+            let _ = lru_cache.insert(2, 2);
+            let _ = lru_cache.insert(3, 3);
+
+            let (_replaced, _expired, lru_values) = lru_cache.notify_insert(4, 4);
+            assert_eq!(lru_values.len(), 1);
+            assert_eq!(lru_values[0], (1, 1));
         }
     }
 
