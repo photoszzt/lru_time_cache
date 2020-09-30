@@ -86,26 +86,29 @@
 use sn_fake_clock::FakeClock as Instant;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, VecDeque};
+use std::convert::TryInto;
 use std::time::Duration;
 #[cfg(not(feature = "sn_fake_clock"))]
 use std::time::Instant;
 use std::usize;
 
 mod iter;
+mod meter;
 pub use crate::iter::{Iter, NotifyIter, PeekIter, TimedEntry};
+pub use crate::meter::{Count, CountableMeter, Meter};
 
 /// A view into a single entry in an LRU cache, which may either be vacant or occupied.
-pub enum Entry<'a, Key: 'a, Value: 'a> {
+pub enum Entry<'a, Key: 'a, Value: 'a, M: CountableMeter<Key, Value> = Count> {
     /// A vacant Entry
-    Vacant(VacantEntry<'a, Key, Value>),
+    Vacant(VacantEntry<'a, Key, Value, M>),
     /// An occupied Entry
     Occupied(OccupiedEntry<'a, Value>),
 }
 
 /// A vacant Entry.
-pub struct VacantEntry<'a, Key, Value> {
+pub struct VacantEntry<'a, Key, Value, M: CountableMeter<Key, Value> = Count> {
     key: Key,
-    cache: &'a mut LruCache<Key, Value>,
+    cache: &'a mut LruCache<Key, Value, M>,
 }
 
 /// An occupied Entry.
@@ -114,34 +117,38 @@ pub struct OccupiedEntry<'a, Value> {
 }
 
 /// Implementation of [LRU cache](index.html#least-recently-used-lru-cache).
-pub struct LruCache<Key, Value> {
+#[derive(Clone)]
+pub struct LruCache<Key, Value, M: CountableMeter<Key, Value> = Count> {
     map: BTreeMap<Key, (Value, Instant)>,
     list: VecDeque<Key>,
     capacity: usize,
     time_to_live: Option<Duration>,
+    current_measure: M::Measure,
+    meter: M,
 }
 
-impl<Key, Value> LruCache<Key, Value>
-where
-    Key: Ord + Clone,
-{
+impl<Key: Ord + Clone, Value> LruCache<Key, Value, Count> {
     /// Constructor for capacity based `LruCache`.
-    pub fn with_capacity(capacity: usize) -> LruCache<Key, Value> {
+    pub fn with_capacity(capacity: usize) -> Self {
         LruCache {
             map: BTreeMap::new(),
             list: VecDeque::with_capacity(capacity),
             capacity,
             time_to_live: None,
+            current_measure: (),
+            meter: Count,
         }
     }
 
     /// Constructor for time based `LruCache`.
-    pub fn with_expiry_duration(time_to_live: Duration) -> LruCache<Key, Value> {
+    pub fn with_expiry_duration(time_to_live: Duration) -> Self {
         LruCache {
             map: BTreeMap::new(),
             list: VecDeque::new(),
             capacity: usize::MAX,
             time_to_live: Some(time_to_live),
+            current_measure: (),
+            meter: Count,
         }
     }
 
@@ -155,6 +162,41 @@ where
             list: VecDeque::with_capacity(capacity),
             capacity,
             time_to_live: Some(time_to_live),
+            current_measure: (),
+            meter: Count,
+        }
+    }
+}
+
+impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value, M> {
+    /// Creates an empty cache that can hold at most `capacity` as measured by `meter`.
+    ///
+    /// You can implement the [`Meter`][meter] trait to allow custom metrics.
+    pub fn with_meter(capacity: usize, meter: M) -> Self {
+        LruCache {
+            map: BTreeMap::new(),
+            list: VecDeque::with_capacity(capacity),
+            capacity,
+            time_to_live: None,
+            current_measure: Default::default(),
+            meter,
+        }
+    }
+
+    /// Create an empty cache that can hold at most `capacity` as measured by `meter` and
+    /// entry will be expired
+    pub fn with_expiry_duration_and_meter(
+        time_to_live: Duration,
+        capacity: usize,
+        meter: M,
+    ) -> Self {
+        LruCache {
+            map: BTreeMap::new(),
+            list: VecDeque::with_capacity(capacity),
+            capacity,
+            time_to_live: Some(time_to_live),
+            current_measure: Default::default(),
+            meter,
         }
     }
 
@@ -188,6 +230,9 @@ where
                 .iter()
                 .position(|l| l.borrow() == key)
                 .map(|p| self.list.remove(p));
+            self.current_measure = self
+                .meter
+                .sub(self.current_measure, self.meter.measure(key, &value));
             value
         })
     }
@@ -274,6 +319,14 @@ where
         })
     }
 
+    /// Returns the size of all the key-value pairs in the cache, as measured by the `Meter` used
+    /// by the cache.
+    pub fn size(&self) -> u64 {
+        self.meter
+            .size(self.current_measure)
+            .unwrap_or_else(|| self.len() as u64)
+    }
+
     /// Returns `true` if there are no non-expired entries in the cache.
     pub fn is_empty(&self) -> bool {
         let now = Instant::now();
@@ -286,7 +339,7 @@ where
     }
 
     /// Gets the given key's corresponding entry in the map for in-place manipulation.
-    pub fn entry(&mut self, key: Key) -> Entry<'_, Key, Value> {
+    pub fn entry(&mut self, key: Key) -> Entry<'_, Key, Value, M> {
         // We need to do it the ugly way below due to this issue:
         // https://github.com/rust-lang/rfcs/issues/811
         // match self.get_mut(&key) {
@@ -323,6 +376,12 @@ where
     /// Returns an iterator over all entries that does not modify the timestamps.
     pub fn peek_iter(&self) -> PeekIter<'_, Key, Value> {
         PeekIter::new(&self.map, &self.list, self.time_to_live)
+    }
+
+    /// Returns the maximum size of the key-value pairs the cache can hold, as measured by the
+    /// `Meter` used by the cache.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     // Move `key` in the ordered list to the last
@@ -365,13 +424,19 @@ where
         now: Instant,
     ) -> (Option<Value>, Vec<(Key, Value)>) {
         let expired = self.remove_expired(now);
-        if self.map.contains_key(&key) {
+
+        let new_size = self.meter.measure(&key, &value);
+        self.current_measure = self.meter.add(self.current_measure, new_size);
+
+        if let Some((old, _)) = self.map.get(&key) {
             Self::update_key(&mut self.list, &key);
+            self.current_measure = self
+                .meter
+                .sub(self.current_measure, self.meter.measure(&key, &old))
         } else {
             self.remove_lru();
             self.list.push_back(key.clone());
         };
-
         (
             self.map.insert(key, (value, now)).map(|pair| pair.0),
             expired,
@@ -392,7 +457,9 @@ where
 
     /// If expiry timeout is set, removes expired items from the cache and returns them.
     fn remove_expired(&mut self, now: Instant) -> Vec<(Key, Value)> {
-        let (map, list) = (&mut self.map, &mut self.list);
+        let (map, list, current_measure) =
+            (&mut self.map, &mut self.list, &mut self.current_measure);
+        let meter = &self.meter;
 
         if let Some(ttl) = self.time_to_live {
             let mut expired_values = Vec::new();
@@ -400,8 +467,11 @@ where
                 if map[key].1 + ttl >= now {
                     break;
                 }
-                if let Some(entry) = map.remove(key) {
-                    expired_values.push(entry.0);
+                if let Some(v) = map.remove(key).map(|(value, _)| {
+                    *current_measure = meter.sub(*current_measure, meter.measure(key, &value));
+                    value
+                }) {
+                    expired_values.push(v);
                 }
             }
             // remove keys as well
@@ -418,25 +488,14 @@ where
 
     /// Removes least recently used items to make space for new ones.
     fn remove_lru(&mut self) {
-        if self.map.len() >= self.capacity {
-            for key in self.list.drain(..=self.map.len() - self.capacity) {
-                assert!(self.map.remove(&key).is_some());
-            }
-        }
-    }
-}
-
-impl<Key, Value> Clone for LruCache<Key, Value>
-where
-    Key: Clone,
-    Value: Clone,
-{
-    fn clone(&self) -> LruCache<Key, Value> {
-        LruCache {
-            map: self.map.clone(),
-            list: self.list.clone(),
-            capacity: self.capacity,
-            time_to_live: self.time_to_live,
+        while self.size() >= self.capacity.try_into().unwrap() {
+            let _ = self.list.pop_front().map(|k| {
+                let _ = self.map.remove(&k).map(|(v, _)| {
+                    self.current_measure = self
+                        .meter
+                        .sub(self.current_measure, self.meter.measure(&k, &v));
+                });
+            });
         }
     }
 }
