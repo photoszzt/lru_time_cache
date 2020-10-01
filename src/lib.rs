@@ -122,7 +122,7 @@ pub struct OccupiedEntry<'a, Value> {
 pub struct LruCache<Key, Value, M: CountableMeter<Key, Value> = Count> {
     map: BTreeMap<Key, (Value, Instant)>,
     list: VecDeque<Key>,
-    capacity: usize,
+    capacity: u64,
     time_to_live: Option<Duration>,
     current_measure: M::Measure,
     meter: M,
@@ -130,10 +130,10 @@ pub struct LruCache<Key, Value, M: CountableMeter<Key, Value> = Count> {
 
 impl<Key: Ord + Clone, Value> LruCache<Key, Value, Count> {
     /// Constructor for capacity based `LruCache`.
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: u64) -> Self {
         LruCache {
             map: BTreeMap::new(),
-            list: VecDeque::with_capacity(capacity),
+            list: VecDeque::with_capacity(capacity.try_into().unwrap()),
             capacity,
             time_to_live: None,
             current_measure: (),
@@ -146,7 +146,7 @@ impl<Key: Ord + Clone, Value> LruCache<Key, Value, Count> {
         LruCache {
             map: BTreeMap::new(),
             list: VecDeque::new(),
-            capacity: usize::MAX,
+            capacity: u64::MAX,
             time_to_live: Some(time_to_live),
             current_measure: (),
             meter: Count,
@@ -156,11 +156,11 @@ impl<Key: Ord + Clone, Value> LruCache<Key, Value, Count> {
     /// Constructor for dual-feature capacity and time based `LruCache`.
     pub fn with_expiry_duration_and_capacity(
         time_to_live: Duration,
-        capacity: usize,
+        capacity: u64,
     ) -> LruCache<Key, Value> {
         LruCache {
             map: BTreeMap::new(),
-            list: VecDeque::with_capacity(capacity),
+            list: VecDeque::with_capacity(capacity.try_into().unwrap()),
             capacity,
             time_to_live: Some(time_to_live),
             current_measure: (),
@@ -173,10 +173,10 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     /// Creates an empty cache that can hold at most `capacity` as measured by `meter`.
     ///
     /// You can implement the [`Meter`][meter] trait to allow custom metrics.
-    pub fn with_meter(capacity: usize, meter: M) -> Self {
+    pub fn with_meter(capacity: u64, meter: M) -> Self {
         LruCache {
             map: BTreeMap::new(),
-            list: VecDeque::with_capacity(capacity),
+            list: VecDeque::new(),
             capacity,
             time_to_live: None,
             current_measure: Default::default(),
@@ -186,14 +186,10 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
 
     /// Create an empty cache that can hold at most `capacity` as measured by `meter` and
     /// entry will be expired
-    pub fn with_expiry_duration_and_meter(
-        time_to_live: Duration,
-        capacity: usize,
-        meter: M,
-    ) -> Self {
+    pub fn with_expiry_duration_and_meter(time_to_live: Duration, capacity: u64, meter: M) -> Self {
         LruCache {
             map: BTreeMap::new(),
-            list: VecDeque::with_capacity(capacity),
+            list: VecDeque::new(),
             capacity,
             time_to_live: Some(time_to_live),
             current_measure: Default::default(),
@@ -205,7 +201,7 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
     ///
     /// If the key already existed in the cache, the existing value is returned and overwritten in
     /// the cache.  Otherwise, the key-value pair is inserted and `None` is returned.
-    /// Evicts and returns expired entries and removed lru_entries.
+    /// Evicts and returns expired entries and evicted entries by lru.
     pub fn notify_insert(
         &mut self,
         key: Key,
@@ -429,7 +425,7 @@ impl<Key: Ord + Clone, Value, M: CountableMeter<Key, Value>> LruCache<Key, Value
 
     /// Returns the maximum size of the key-value pairs the cache can hold, as measured by the
     /// `Meter` used by the cache.
-    pub fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> u64 {
         self.capacity
     }
 
@@ -646,7 +642,7 @@ mod test {
 
     #[test]
     fn size_only() {
-        let size = 10usize;
+        let size = 10u64;
         let mut lru_cache = super::LruCache::<usize, usize>::with_capacity(size);
 
         for i in 0..10 {
@@ -655,9 +651,9 @@ mod test {
             assert_eq!(lru_cache.len(), i + 1);
         }
 
-        for i in 10..1000 {
+        for i in 10usize..1000usize {
             let _ = lru_cache.insert(i, i);
-            assert_eq!(lru_cache.len(), size);
+            assert_eq!(lru_cache.len() as u64, size);
         }
 
         for _ in (0..1000).rev() {
@@ -712,22 +708,23 @@ mod test {
 
     #[test]
     fn time_and_size() {
-        let size = 10usize;
+        let size = 10u64;
         let time_to_live = Duration::from_millis(100);
         let mut lru_cache =
-            super::LruCache::<usize, usize>::with_expiry_duration_and_capacity(time_to_live, size);
+            super::LruCache::<u64, u64>::with_expiry_duration_and_capacity(time_to_live, size);
 
         for i in 0..1000 {
-            if i < size {
-                assert_eq!(lru_cache.len(), i);
+            let size_usize = size.try_into().unwrap();
+            if i < size_usize {
+                assert_eq!(lru_cache.len() as u64, i);
             }
 
             let _ = lru_cache.insert(i, i);
 
-            if i < size {
-                assert_eq!(lru_cache.len(), i + 1);
+            if i < size_usize {
+                assert_eq!(lru_cache.len() as u64, i + 1);
             } else {
-                assert_eq!(lru_cache.len(), size);
+                assert_eq!(lru_cache.len() as u64, size_usize);
             }
         }
 
@@ -737,18 +734,6 @@ mod test {
         assert_eq!(lru_cache.len(), 1);
     }
 
-    #[test]
-    fn test_heapsize_cache() {
-        let mut cache = LruCache::<&str, (u8, u8, u8), HeapSize>::with_meter(8, HeapSize);
-        let _ = cache.insert("foo1", (1, 2, 3));
-        let _ = cache.insert("foo2", (4, 5, 6));
-        let _ = cache.insert("foo3", (7, 8, 9));
-        assert!(!cache.contains_key("foo1"));
-        let _ = cache.insert("foo2", (10, 11, 12));
-        let _ = cache.insert("foo4", (13, 14, 15));
-        assert!(!cache.contains_key("foo3"));
-    }
-
     #[derive(PartialEq, PartialOrd, Ord, Clone, Eq)]
     struct Temp {
         id: Vec<u8>,
@@ -756,15 +741,15 @@ mod test {
 
     #[test]
     fn time_size_struct_value() {
-        let size = 100usize;
+        let size = 100u64;
         let time_to_live = Duration::from_millis(100);
 
         let mut lru_cache =
-            super::LruCache::<Temp, usize>::with_expiry_duration_and_capacity(time_to_live, size);
+            super::LruCache::<Temp, u64>::with_expiry_duration_and_capacity(time_to_live, size);
 
         for i in 0..1000 {
             if i < size {
-                assert_eq!(lru_cache.len(), i);
+                assert_eq!(lru_cache.len() as u64, i);
             }
 
             let _ = lru_cache.insert(
@@ -775,9 +760,9 @@ mod test {
             );
 
             if i < size {
-                assert_eq!(lru_cache.len(), i + 1);
+                assert_eq!(lru_cache.len() as u64, i + 1);
             } else {
-                assert_eq!(lru_cache.len(), size);
+                assert_eq!(lru_cache.len() as u64, size);
             }
         }
 
